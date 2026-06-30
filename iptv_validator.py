@@ -3,7 +3,7 @@
 """
 ╔══════════════════════════════════════════════════════════╗
 ║   IPTV VALIDATOR CHECKER — GUI Edition                  ║
-║   by M4DI~UciH4  |  v3.0                               ║
+║   by M4DI~UciH4  |  v3.1                               ║
 ║   Requires: Python 3.8+, requests                       ║
 ║   GUI: tkinter (built-in, no extra install)             ║
 ╚══════════════════════════════════════════════════════════╝
@@ -32,6 +32,7 @@ _check_deps()
 # ─────────────────────────────────────────────────────────
 import re, time, socket, urllib.parse
 import threading, queue, csv, datetime
+import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
@@ -44,7 +45,7 @@ from tkinter import ttk, filedialog, messagebox
 # ─────────────────────────────────────────────────────────
 #  CONSTANTS
 # ─────────────────────────────────────────────────────────
-VERSION    = "3.0"
+VERSION    = "3.1"
 AUTHOR     = "M4DI~UciH4"
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -131,6 +132,236 @@ def _make_session() -> requests.Session:
     return sess
 
 
+# ─────────────────────────────────────────────────────────
+#  MPD MANIFEST PARSER
+# ─────────────────────────────────────────────────────────
+def parse_mpd_manifest(xml_text: str, base_url: str) -> dict:
+    """
+    Parse konten XML MPD manifest.
+    Return dict:
+      type        : 'LIVE' | 'VOD' | 'unknown'
+      drm         : True/False
+      drm_systems : list nama DRM (Widevine, PlayReady, ClearKey)
+      base_url    : base URL stream
+      init_url    : URL segment init/pertama untuk dicek
+      error       : pesan error jika parse gagal
+    """
+    result = {
+        "type": "unknown", "drm": False,
+        "drm_systems": [], "base_url": base_url,
+        "init_url": "", "error": ""
+    }
+    try:
+        root = ET.fromstring(xml_text)
+
+        # ── Tipe stream ──
+        mpd_type = root.get("type", "static")
+        result["type"] = "LIVE" if mpd_type == "dynamic" else "VOD"
+
+        # ── Deteksi DRM via ContentProtection ──
+        drm_set = set()
+        for elem in root.iter():
+            tag = elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag
+            if tag == "ContentProtection":
+                s = elem.get("schemeIdUri", "").lower()
+                val = elem.get("value", "").lower()
+                if "edef8ba9" in s or "widevine" in s:
+                    drm_set.add("Widevine")
+                elif "9a04f079" in s or "playready" in s:
+                    drm_set.add("PlayReady")
+                elif "e2719d58" in s or "clearkey" in s or "clearkey" in val:
+                    drm_set.add("ClearKey")
+                elif s and s != "urn:mpeg:dash:mp4protection:2011":
+                    drm_set.add("DRM-Unknown")
+        result["drm"] = len(drm_set) > 0
+        result["drm_systems"] = sorted(drm_set)
+
+        # ── BaseURL ──
+        for elem in root.iter():
+            tag = elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag
+            if tag == "BaseURL" and elem.text:
+                burl = elem.text.strip()
+                result["base_url"] = (
+                    burl if burl.startswith("http")
+                    else urllib.parse.urljoin(base_url, burl)
+                )
+                break
+
+        # ── Init / segment pertama ──
+        # Prioritas: SegmentTemplate initialization > SegmentURL > SegmentBase
+        for elem in root.iter():
+            tag = elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag
+            if tag == "SegmentTemplate":
+                init = elem.get("initialization", "")
+                if init:
+                    # Bersihkan template variable seperti $RepresentationID$
+                    init_clean = re.sub(r"\$[^$]+\$", "1", init)
+                    result["init_url"] = urllib.parse.urljoin(
+                        result["base_url"], init_clean
+                    )
+                    break
+            elif tag == "SegmentURL":
+                media = elem.get("media", "")
+                if media:
+                    result["init_url"] = urllib.parse.urljoin(
+                        result["base_url"], media
+                    )
+                    break
+            elif tag == "SegmentBase":
+                init_range = elem.get("indexRange", "")
+                if init_range:
+                    result["init_url"] = result["base_url"]
+                    break
+
+    except ET.ParseError as exc:
+        result["error"] = f"XML parse error: {str(exc)[:60]}"
+    except Exception as exc:
+        result["error"] = f"MPD parse error: {str(exc)[:60]}"
+
+    return result
+
+
+def check_mpd(url: str, timeout: int = 10) -> dict:
+    """
+    Validasi khusus MPD/DASH stream dengan 3 tahap:
+      1. Download manifest .mpd
+      2. Parse XML → deteksi DRM, tipe, init URL
+      3. Cek aksesibilitas init segment (jika tidak DRM)
+    Return format sama dengan check_url.
+    """
+    result = {"url": url, "status": "OFFLINE",
+              "code": None, "latency": 0, "reason": ""}
+    sess = _make_session()
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "application/dash+xml, application/xml, */*",
+        "Connection": "close",
+    }
+    # Referer hints
+    for pattern, ref in (
+        ("cloudfront",  "https://www.visionplus.id/"),
+        ("3bbtv",       "https://www.3bb.co.th/"),
+        ("jwplive",     "https://cdn.jwplayer.com/"),
+        ("telewebion",  "https://telewebion.com/"),
+        ("ciao-ott",    "https://ciao-ott.net/"),
+    ):
+        if pattern in url:
+            headers["Referer"] = ref
+            break
+
+    # ── Tahap 1: Download manifest ──
+    try:
+        t0 = time.monotonic()
+        resp = sess.get(url, headers=headers, timeout=timeout, stream=True)
+        # Baca max 512 KB (cukup untuk manifest XML)
+        content = b""
+        for chunk in resp.iter_content(chunk_size=8192):
+            content += chunk
+            if len(content) >= 524288:
+                break
+        resp.close()
+        lat = int((time.monotonic() - t0) * 1000)
+        result["latency"] = lat
+        result["code"] = resp.status_code
+    except requests.exceptions.Timeout:
+        result.update(status="TIMEOUT", reason=f"Timeout >{timeout}s saat download manifest")
+        return result
+    except requests.exceptions.ConnectionError as exc:
+        err = str(exc)
+        if "getaddrinfo" in err or "Name or service" in err:
+            result.update(status="OFFLINE", reason="DNS gagal / host tidak ditemukan")
+        else:
+            result.update(status="OFFLINE", reason=err[:80])
+        return result
+    except Exception as exc:
+        result.update(status="ERROR", reason=str(exc)[:80])
+        return result
+
+    if resp.status_code == 401:
+        result.update(status="OFFLINE", reason="401 Unauthorized")
+        return result
+    if resp.status_code == 403:
+        result.update(status="OFFLINE", reason="403 Forbidden (DRM/geo-block)")
+        return result
+    if resp.status_code == 404:
+        result.update(status="OFFLINE", reason="404 Not Found")
+        return result
+    if resp.status_code not in (200, 206):
+        result.update(status="OFFLINE", reason=f"HTTP {resp.status_code}")
+        return result
+
+    # ── Tahap 2: Parse XML ──
+    try:
+        xml_text = content.decode("utf-8", errors="ignore")
+    except Exception:
+        xml_text = ""
+
+    if not xml_text.strip().startswith("<?xml") and "<MPD" not in xml_text:
+        # Bukan XML valid — anggap OFFLINE
+        result.update(status="OFFLINE",
+                      reason="Response bukan MPD XML yang valid")
+        return result
+
+    parsed = parse_mpd_manifest(xml_text, url)
+
+    if parsed["error"]:
+        # Manifest ada tapi tidak bisa di-parse → tetap ONLINE (manifest accessible)
+        result.update(status="ONLINE",
+                      reason=f"MPD manifest OK (parse warn: {parsed['error'][:40]})")
+        return result
+
+    stream_type = parsed["type"]   # LIVE / VOD
+    drm_info = ", ".join(parsed["drm_systems"]) if parsed["drm_systems"] else ""
+
+    # ── Tahap 3: DRM check ──
+    if parsed["drm"]:
+        # DRM terdeteksi → manifest accessible tapi stream terkunci
+        result.update(
+            status="OFFLINE",
+            reason=f"DRM Protected ({drm_info}) — butuh license key"
+        )
+        return result
+
+    # ── Tahap 4: Cek init segment (non-DRM) ──
+    init_url = parsed.get("init_url", "")
+    if init_url and init_url != url:
+        try:
+            t0 = time.monotonic()
+            r2 = sess.head(init_url, headers=headers, timeout=timeout,
+                           allow_redirects=True)
+            lat2 = int((time.monotonic() - t0) * 1000)
+            result["latency"] = lat2
+            if r2.status_code in (200, 206):
+                result.update(
+                    status="ONLINE",
+                    reason=f"MPD {stream_type} OK — init seg HTTP {r2.status_code}"
+                )
+            elif r2.status_code == 405:
+                # HEAD tidak support, manifest sudah OK cukup
+                result.update(
+                    status="ONLINE",
+                    reason=f"MPD {stream_type} OK — manifest accessible"
+                )
+            else:
+                result.update(
+                    status="OFFLINE",
+                    reason=f"MPD manifest OK tapi init seg HTTP {r2.status_code}"
+                )
+        except Exception:
+            # Init seg gagal dicek tapi manifest sudah OK
+            result.update(
+                status="ONLINE",
+                reason=f"MPD {stream_type} OK — manifest accessible"
+            )
+    else:
+        result.update(
+            status="ONLINE",
+            reason=f"MPD {stream_type} OK — manifest accessible"
+        )
+
+    return result
+
+
 def check_url(url: str, timeout: int = 10) -> dict:
     """
     Cek satu URL stream.
@@ -157,6 +388,11 @@ def check_url(url: str, timeout: int = 10) -> dict:
         except Exception as exc:
             result.update(status="OFFLINE", reason=str(exc)[:80])
         return result
+
+    # ── MPD / MPEG-DASH → dedicated checker ──
+    url_path = url.lower().split("?")[0]
+    if url_path.endswith(".mpd") or "/manifest" in url_path:
+        return check_mpd(url, timeout)
 
     # ── HTTP / HTTPS ──
     sess = _make_session()
@@ -631,7 +867,8 @@ class App(tk.Tk):
     def _populate_table_pending(self):
         """Isi tabel dengan semua channel sebagai PENDING sebelum check dimulai."""
         self._clear_table()
-        self._iid_map = {}
+        self._iid_map = {}      # url  → iid
+        self._idx_map = {}      # url  → int index (0-based)
         for idx, ch in enumerate(self._channels):
             row_tag = "ODD" if idx % 2 else "EVEN"
             iid = self._tree.insert(
@@ -643,6 +880,7 @@ class App(tk.Tk):
                 tags=(row_tag,)
             )
             self._iid_map[ch["url"]] = iid
+            self._idx_map[ch["url"]] = idx
 
     # ──────────────────────────────────────────────
     #  CHECK CONTROL
@@ -680,6 +918,10 @@ class App(tk.Tk):
     def _stop_check(self):
         self._running = False
         self._log("Check dihentikan oleh user.", C_RED)
+        # Reset tombol segera — worker thread akan selesai sendiri via flag
+        self._btn_start.config(state=tk.NORMAL)
+        self._btn_stop.config(state=tk.DISABLED)
+        self._btn_export.config(state=tk.NORMAL if self._results else tk.DISABLED)
 
     def _worker_thread(self, channels, timeout, workers):
         total = len(channels)
@@ -687,8 +929,8 @@ class App(tk.Tk):
 
         def task(ch):
             if not self._running:
-                return {"url": ch["url"], "name": ch.get("name",""),
-                        "group": ch.get("group",""), "logo": ch.get("logo",""),
+                return {"url": ch["url"], "name": ch.get("name", ""),
+                        "group": ch.get("group", ""), "logo": ch.get("logo", ""),
                         "status": "OFFLINE", "code": None,
                         "latency": 0, "reason": "Dihentikan"}
             res = check_url(ch["url"], timeout)
@@ -698,19 +940,23 @@ class App(tk.Tk):
             return res
 
         with ThreadPoolExecutor(max_workers=workers) as exe:
+            # Simpan semua future agar bisa di-cancel
             futures = {exe.submit(task, ch): ch for ch in channels}
             for future in as_completed(futures):
                 try:
                     res = future.result()
                 except Exception as exc:
                     ch  = futures[future]
-                    res = {"url": ch.get("url",""), "name": ch.get("name",""),
-                           "group": ch.get("group",""), "logo": ch.get("logo",""),
+                    res = {"url": ch.get("url", ""), "name": ch.get("name", ""),
+                           "group": ch.get("group", ""), "logo": ch.get("logo", ""),
                            "status": "ERROR", "code": None,
                            "latency": 0, "reason": str(exc)[:80]}
                 done += 1
                 self._q.put(("result", res, done, total))
                 if not self._running:
+                    # Cancel semua future yang belum mulai
+                    for f in futures:
+                        f.cancel()
                     break
 
         self._q.put(("done", None, done, total))
@@ -764,7 +1010,7 @@ class App(tk.Tk):
         status  = res["status"]
         lat_str = f"{res['latency']} ms" if res["latency"] else "-"
         code    = str(res["code"]) if res["code"] else "-"
-        idx     = list(self._iid_map.keys()).index(url)
+        idx     = self._idx_map.get(url, 0)          # O(1) lookup
         row_tag = "ODD" if idx % 2 else "EVEN"
         self._tree.item(iid, values=(
             idx + 1, status, lat_str, code,
@@ -799,6 +1045,8 @@ class App(tk.Tk):
     #  FILTER
     # ──────────────────────────────────────────────
     def _apply_filter(self):
+        if self._running:
+            return   # jangan filter saat check berjalan, hindari konflik detach/reattach
         flt = self._filter_var.get()
         for iid in self._tree.get_children():
             vals = self._tree.item(iid, "values")
@@ -812,8 +1060,6 @@ class App(tk.Tk):
     #  SORT
     # ──────────────────────────────────────────────
     def _sort_tree(self, col: str):
-        col_idx = ("#", "STATUS", "LATENCY", "CODE", "NAME", "GROUP", "REASON")
-        ci = col_idx.index(col)
         items = [(self._tree.set(iid, col), iid)
                  for iid in self._tree.get_children("")]
 
@@ -845,15 +1091,14 @@ class App(tk.Tk):
         sel = self._tree.selection()
         if not sel:
             return
-        vals = self._tree.item(sel[0], "values")
-        # find URL from name match
-        name = vals[4] if len(vals) > 4 else ""
-        for r in self._results:
-            if r.get("name", "")[:60] == name:
-                self.clipboard_clear()
-                self.clipboard_append(r["url"])
-                self._log(f"URL disalin: {r['url'][:70]}", C_YELLOW)
-                return
+        iid = sel[0]
+        # Cari URL dengan reverse lookup dari _iid_map (akurat, tidak bergantung nama)
+        url = next((u for u, i in self._iid_map.items() if i == iid), None)
+        if not url:
+            return
+        self.clipboard_clear()
+        self.clipboard_append(url)
+        self._log(f"URL disalin: {url[:80]}", C_YELLOW)
 
     # ──────────────────────────────────────────────
     #  CLEAR ALL
@@ -878,6 +1123,10 @@ class App(tk.Tk):
     #  EXPORT
     # ──────────────────────────────────────────────
     def _export_results(self):
+        if self._running:
+            messagebox.showwarning("Masih Berjalan",
+                                   "Tunggu proses selesai atau klik STOP sebelum export.")
+            return
         if not self._results:
             messagebox.showwarning("Tidak Ada Data", "Belum ada hasil untuk di-export.")
             return
